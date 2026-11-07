@@ -77,6 +77,10 @@ import org.apache.http.protocol.HttpProcessor;
 import org.apache.http.protocol.ImmutableHttpProcessor;
 import org.apache.http.protocol.RequestTargetHost;
 
+// 普通客户端的 HTTP 策略状态机，实例由 builder 创建并供多个 exchange 共用。
+// 本类字段只保存策略；每次请求可变状态放在 InternalState 和 handler，不能放进共享 exec。
+// prepare 在 execute 调用栈中规划初始请求；其余方法由 exchange 转发协议层事件。
+// 一次逻辑请求可经历 CONNECT、认证挑战和重定向；只有 finalResponse 才交给用户 consumer。
 class MainClientExec implements InternalClientExec {
 
     private final Log log = LogFactory.getLog(getClass());
@@ -123,6 +127,7 @@ class MainClientExec implements InternalClientExec {
 
         final HttpClientContext localContext = state.getLocalContext();
 
+        // 请求级 RequestConfig 若存在，覆盖先前由 context / client 默认值填充的配置。
         if (original instanceof Configurable) {
             final RequestConfig config = ((Configurable) original).getConfig();
             if (config != null) {
@@ -135,6 +140,8 @@ class MainClientExec implements InternalClientExec {
             redirectLocations.clear();
         }
 
+        // wrapper 承载 URI/header 的执行期改写。target 只是 producer 提供的逻辑目标；
+        // routePlanner 可以选代理、补端口或改路由，此时还没有实际连接。
         final HttpRequestWrapper request = HttpRequestWrapper.wrap(original);
         final HttpRoute route = this.routePlanner.determineRoute(target, request, localContext);
 
@@ -143,6 +150,8 @@ class MainClientExec implements InternalClientExec {
         state.setMainRequest(request);
         handler.setCurrentRequest(request);
 
+        // 初始请求拦截器也在申请连接之前运行；不能把此时 context 中可能残留的
+        // HTTP_CONNECTION 当成本次连接。重定向时同一方法还会再次运行。
         prepareRequest(state, handler);
     }
 
@@ -153,6 +162,9 @@ class MainClientExec implements InternalClientExec {
 
         final HttpRoute route = handler.getRoute();
 
+        // 已租到 TCP 连接，但“TCP 连通”和“HTTP 路由可用”是两件事。
+        // 新 HTTPS 代理连接还需 CONNECT -> 等响应 -> TLS 升级 -> 发送业务请求；
+        // 池中已有完整路由的连接可以直接跳过这套建立过程。
         handler.verifytRoute();
 
         if (!handler.isRouteEstablished()) {
@@ -172,6 +184,8 @@ class MainClientExec implements InternalClientExec {
                     if (this.log.isDebugEnabled()) {
                         this.log.debug("[exchange: " + state.getId() + "] Tunnel required");
                     }
+                    // CONNECT 是本 handler 内部的当前请求，mainRequest 仍保存用户请求。
+                    // 本轮先返回 CONNECT，待其响应成功后下一轮 generateRequest 再继续。
                     final HttpRequest connect = createConnectRequest(route, state);
                     handler.setCurrentRequest(HttpRequestWrapper.wrap(connect));
                     break loop;
@@ -202,6 +216,8 @@ class MainClientExec implements InternalClientExec {
         }
 
         if (handler.isRouteEstablished()) {
+            // execCount 统计业务请求发送尝试，CONNECT 不在这里计数。
+            // 认证/重定向等后续发送复用原 producer；已经开始写过不可重复实体时不能重放。
             state.incrementExecCount();
             if (state.getExecCount() > 1) {
                 final HttpAsyncRequestProducer requestProducer = state.getRequestProducer();
@@ -241,6 +257,9 @@ class MainClientExec implements InternalClientExec {
         }
 
         final NHttpClientConnection managedConn = handler.getConnection();
+        // 发布的是可变 context 中的连接代理，供本次处理使用，并非地址快照。
+        // 用户 producer / interceptor 可重入 execute，甚至复用此 context；完成时连接
+        // 又可能已归还，因此“从 context 取到连接”本身不足以证明其归属或可读寿命。
         localContext.setAttribute(HttpCoreContext.HTTP_CONNECTION, managedConn);
         final RequestConfig config = localContext.getRequestConfig();
         if (config.getSocketTimeout() > 0) {
@@ -258,6 +277,8 @@ class MainClientExec implements InternalClientExec {
             this.log.debug("[exchange: " + state.getId() + "] produce content");
         }
         final HttpAsyncRequestProducer requestProducer = state.getRequestProducer();
+        // 标记在调用用户代码前置位；代表已进入内容生产，不保证已写出完整实体。
+        // ContentEncoder / IOControl 属于非阻塞增量生产，不能在这里等待同 reactor 的其他请求。
         state.setRequestContentProduced();
         requestProducer.produceContent(encoder, ioControl);
         if (encoder.isCompleted()) {
@@ -274,6 +295,9 @@ class MainClientExec implements InternalClientExec {
         }
         final HttpClientContext localContext = state.getLocalContext();
         final HttpAsyncRequestProducer requestProducer = state.getRequestProducer();
+        // 只表示当前请求发送完成，不是服务端处理完毕或逻辑 execute 完成。
+        // HttpCore 可在 Expect: 100-continue 阶段收到最终拒绝响应而不调用此方法，
+        // 因此它既不是每次响应必经点，也不是可靠的首次连接观测点。
         requestProducer.requestCompleted(localContext);
     }
 
@@ -287,6 +311,8 @@ class MainClientExec implements InternalClientExec {
         }
         final HttpClientContext context = state.getLocalContext();
         context.setAttribute(HttpCoreContext.HTTP_RESPONSE, response);
+        // 先运行响应拦截器，再判断 CONNECT/认证/重定向及是否交付用户 consumer。
+        // 这里会进入用户扩展点，context 可被访问；读取连接信息要考虑扩展点之前的归属。
         this.httpProcessor.process(response, context);
 
         handler.setCurrentResponse(response);
@@ -298,6 +324,7 @@ class MainClientExec implements InternalClientExec {
                         response.getStatusLine());
             }
             if (status == HttpStatus.SC_OK) {
+                // 仅推进到隧道已建立；TLS/业务请求在下一次发送事件完成，不在此递归发送。
                 handler.onRouteTunnelToTarget();
                 handler.setCurrentRequest(null);
             } else {
@@ -328,6 +355,8 @@ class MainClientExec implements InternalClientExec {
             final HttpAsyncResponseConsumer<?> responseConsumer = state.getResponseConsumer();
             responseConsumer.consumeContent(decoder, ioControl);
         } else {
+            // 中间响应（例如 401/302）的实体也必须读完，才能在同一连接上解析下个响应。
+            // 这里只增量读入复用的 4 KiB 缓冲并丢弃，不缓存整个中间响应，也不交给用户。
             final ByteBuffer tmpbuf = state.getTmpbuf();
             tmpbuf.clear();
             decoder.read(tmpbuf);
@@ -344,11 +373,14 @@ class MainClientExec implements InternalClientExec {
         if (!handler.isRouteEstablished()) {
             final int status = currentResponse.getStatusLine().getStatusCode();
             if (status == HttpStatus.SC_OK) {
+                // CONNECT 的成功响应结束不意味着业务响应结束；保留连接推进 TLS/目标请求。
                 handler.setCurrentResponse(null);
                 return;
             }
         }
 
+        // 决定当前连接是否可继续用，再决定是否继续逻辑请求。
+        // 非 keep-alive 不自动意味着 execute 失败：认证/重定向仍可换连接继续。
         final boolean keepAlive = handler.manageConnectionPersistence();
         if (!keepAlive) {
             handler.releaseConnection();
@@ -380,6 +412,8 @@ class MainClientExec implements InternalClientExec {
 
         if (state.getFinalResponse() != null) {
             final HttpAsyncResponseConsumer<?> responseConsumer = state.getResponseConsumer();
+            // consumer 在此将累计实体转换成最终结果，Default handler 随后才完成 Future。
+            // 非 keep-alive 分支可能已先归还连接；即使本分支仍持有连接，也会在 callback 前释放。
             responseConsumer.responseCompleted(localContext);
             if (this.log.isDebugEnabled()) {
                 this.log.debug("[exchange: " + state.getId() + "] Response processed");
@@ -387,6 +421,8 @@ class MainClientExec implements InternalClientExec {
             handler.releaseConnection();
         } else {
             if (state.getRedirect() != null) {
+                // 此时上个响应体已读完，才切换请求与路由。一个 execute 的 producer/Future
+                // 保持不变，所以仅在最初 producer.generateRequest 观察不到后续目的地。
                 final HttpUriRequest redirect = state.getRedirect();
                 final URI uri = redirect.getURI();
                 if (this.log.isDebugEnabled()) {
@@ -425,6 +461,8 @@ class MainClientExec implements InternalClientExec {
                 final HttpRequestWrapper newRequest = HttpRequestWrapper.wrap(redirect);
                 final HttpRoute newRoute = this.routePlanner.determineRoute(
                     newTarget, newRequest, localContext);
+                // route 包含代理/隧道/本地绑定等信息，比较完整 route，而不是只比较目标域名。
+                // 不同 route 释放旧连接；同 route 留给 handler 决定是否可继续发送。
                 if (!route.equals(newRoute)) {
                     handler.releaseConnection();
                 }
@@ -443,6 +481,8 @@ class MainClientExec implements InternalClientExec {
         try {
             URI uri = request.getURI();
             if (uri != null) {
+                // 普通 HTTP 代理发送 absolute-form；直连或已建立隧道发送 origin-form。
+                // 请求行的 URI 形态由传输路线决定，不能据它反推 TCP 对端是谁。
                 if (route.getProxyHost() != null && !route.isTunnelled()) {
                     // Make sure the request URI is absolute
                     if (!uri.isAbsolute()) {
@@ -495,6 +535,8 @@ class MainClientExec implements InternalClientExec {
         // Re-write request URI if needed
         rewriteRequestURI(currentRequest, route);
 
+        // 拦截器中的 HTTP_TARGET_HOST 优先表示原始绝对 URI 的逻辑目标，可能不同于
+        // routePlanner 决定的连接目的地。Host/URL、route、socket peer 是不同层次的信息。
         HttpHost target = null;
         if (uri != null && uri.isAbsolute() && uri.getHost() != null) {
             target = new HttpHost(uri.getHost(), uri.getPort(), uri.getScheme());
@@ -522,6 +564,8 @@ class MainClientExec implements InternalClientExec {
 
     private HttpRequest createConnectRequest(
             final HttpRoute route, final InternalState state) throws IOException, HttpException {
+        // 发给代理的请求行是 CONNECT targetHost:targetPort；这里的端口描述隧道目标，
+        // 不描述已经连上的代理端口。只走 proxyHttpProcessor，不生成第二个用户 producer。
         // see RFC 2817, section 5.2 and
         // INTERNET-DRAFT: Tunneling TCP based protocols through
         // Web proxy servers
@@ -565,6 +609,8 @@ class MainClientExec implements InternalClientExec {
             final AbstractClientExchangeHandler handler) throws HttpException {
         final HttpClientContext localContext = state.getLocalContext();
         final RequestConfig config = localContext.getRequestConfig();
+        // true 表示已安排后续交换，当前响应不是 finalResponse；认证优先于重定向。
+        // false 才将响应交给用户 consumer。这不是依据 HTTP 状态码简单判定成功/失败。
         if (config.isAuthenticationEnabled()) {
             if (needAuthentication(state, handler)) {
                 // discard previous auth headers

@@ -43,6 +43,11 @@ import org.apache.http.protocol.HttpContext;
 
 class CPoolProxy implements ManagedNHttpClientConnection {
 
+    /*
+     * 一次租赁的访问句柄，不拥有独立 socket。CPoolEntry/真实连接可跨多个 exchange 复用，
+     * 但本代理在 releaseConnection 中 detach 后永久失效；下次租赁会创建另一个代理。
+     * volatile 让其他线程看见解绑，不会把“查 entry + 使用真实连接”组合成原子操作。
+     */
     private volatile CPoolEntry poolEntry;
 
     CPoolProxy(final CPoolEntry entry) {
@@ -55,6 +60,8 @@ class CPoolProxy implements ManagedNHttpClientConnection {
     }
 
     CPoolEntry detach() {
+        // 管理器在 synchronized(managedConn) 内调用，串行化同一代理的重复释放及路由变更。
+        // 此处仅移交池项，是否关闭或复用真实连接由管理器随后决定。
         final CPoolEntry local = this.poolEntry;
         this.poolEntry = null;
         return local;
@@ -70,6 +77,7 @@ class CPoolProxy implements ManagedNHttpClientConnection {
 
     ManagedNHttpClientConnection getValidConnection() {
         final ManagedNHttpClientConnection conn = getConnection();
+        // “有效”指代理仍附着于池项，不是额外的 socket 存活检测；失效代理直接拒绝访问。
         if (conn == null) {
             throw new ConnectionShutdownException();
         }
@@ -78,6 +86,7 @@ class CPoolProxy implements ManagedNHttpClientConnection {
 
     @Override
     public void close() throws IOException {
+        // close/shutdown 操作的是底层连接，但不会 detach 或归还 entry；租赁释放仍由管理器负责。
         final CPoolEntry local = this.poolEntry;
         if (local != null) {
             local.closeConnection();
@@ -141,6 +150,8 @@ class CPoolProxy implements ManagedNHttpClientConnection {
 
     @Override
     public InetAddress getRemoteAddress() {
+        // 委托真实连接的 HttpInetConnection 视图，不从 route/HttpHost 推导。
+        // release 后即使 context 或用户代码还持有本代理，这条路径也会因 detach 而抛异常。
         return getValidConnection().getRemoteAddress();
     }
 
@@ -212,6 +223,7 @@ class CPoolProxy implements ManagedNHttpClientConnection {
     }
 
     public static NHttpClientConnection newProxy(final CPoolEntry poolEntry) {
+        // 代理的生命周期比连接短：不能用代理对象的长期存活推断其租赁仍然有效。
         return new CPoolProxy(poolEntry);
     }
 

@@ -95,6 +95,14 @@ import org.apache.http.util.Asserts;
 public class PoolingNHttpClientConnectionManager
        implements NHttpClientConnectionManager, ConnPoolControl<HttpRoute> {
 
+    /*
+     * 连接管理分为三层：本类把 HttpRoute、租赁回调和 TLS 路由建立衔接起来；CPool /
+     * HttpCore AbstractNIOConnPool 管理连接容量、等待队列及复用；ConnectingIOReactor
+     * 完成实际的非阻塞 TCP 连接。HttpRoute 是池的分组依据，不能直接当作已连接的 peer。
+     *
+     * 池中长期保存 CPoolEntry 和真实连接，每次租赁另建 CPoolProxy；释放先让本次代理失效，
+     * 可复用的真实连接仍留在池中。HTTP exchange 与物理连接因此不是一对一关系。
+     */
     private final Log log = LogFactory.getLog(getClass());
 
     static final String IOSESSION_FACTORY_REGISTRY = "http.ioSession-factory-registry";
@@ -189,6 +197,8 @@ public class PoolingNHttpClientConnectionManager
         Args.notNull(socketAddressResolver, "Socket address resolver");
         this.ioReactor = ioReactor;
         this.configData = new ConfigData();
+        // 自定义 SocketAddressResolver 可完全接管 route 到 socket 地址的转换；只有使用
+        // InternalAddressResolver 的构造路径才遵循本文件末尾的默认端口和 DNS 解析规则。
         this.pool = new CPool(ioReactor,
                 new InternalConnectionFactory(this.configData, connFactory),
                 socketAddressResolver,
@@ -266,6 +276,12 @@ public class PoolingNHttpClientConnectionManager
         return buf.toString();
     }
 
+    /*
+     * 普通 exchange 由 AbstractClientExchangeHandler.requestConnection 调用：route 来自
+     * 路由规划，state 是 HttpClientContext 的 user token，用于连接亲和性，而不是请求 ID。
+     * connectTimeout 约束新建 TCP 连接；leaseTimeout 约束池中尚未分配连接的等待请求。
+     * 它们与请求/响应读写阶段的 socket timeout 是不同的控制点。
+     */
     @Override
     public Future<NHttpClientConnection> requestConnection(
             final HttpRoute route,
@@ -279,6 +295,7 @@ public class PoolingNHttpClientConnectionManager
             this.log.debug("Connection request: " + format(route, state) + formatStats(route));
         }
         final BasicFuture<NHttpClientConnection> resultFuture = new BasicFuture<NHttpClientConnection>(callback);
+        // 这里先检查第一跳的传输协议是否受支持；此时尚未证明建连成功，也没有获得 socket 地址。
         final HttpHost host;
         if (route.getProxyHost() != null) {
             host = route.getProxyHost();
@@ -292,6 +309,16 @@ public class PoolingNHttpClientConnectionManager
                     " protocol is not supported"));
             return resultFuture;
         }
+        /*
+         * HttpCore 4.4.11 的池先找相同 route、匹配 state（或未绑定 state）的空闲 entry，
+         * 淘汰关闭/过期项；找不到且容量允许时才解析地址并调用 ioReactor.connect。
+         * 复用不重新 DNS 解析，因此即使同一路由的 DNS 已变化，现存连接仍连接原来的 peer。
+         *
+         * lease 不是强制异步切线程的边界：立即复用可在当前调用栈内完成；排队请求也可能
+         * 在归还连接的线程完成；新连接通常在 reactor 工作线程注册 IOSession 时完成。
+         * 4.4.11 的 lease/release 复用路径退出自身池锁临界区后调用 fireCallbacks；新连接
+         * 则经 requestCompleted -> RouteSpecificPool.completed 在池锁内通知，不能统一假定锁外。
+         */
         final Future<CPoolEntry> leaseFuture = this.pool.lease(route, state,
                 connectTimeout, leaseTimeout, timeUnit != null ? timeUnit : TimeUnit.MILLISECONDS,
                 new FutureCallback<CPoolEntry>() {
@@ -302,7 +329,10 @@ public class PoolingNHttpClientConnectionManager
                         if (log.isDebugEnabled()) {
                             log.debug("Connection leased: " + format(entry) + formatStats(entry.getRoute()));
                         }
+                        // 即使复用同一个 entry，也为当前租赁创建独立代理；回调拿到的不是池内实体。
                         final NHttpClientConnection managedConn = CPoolProxy.newProxy(entry);
+                        // BasicFuture 先发布结果/唤醒 get()，随后在当前线程直接调用 callback。
+                        // 返回 false 表示外层 Future 已终结（例如取消抢先发生），需要归还 entry。
                         if (!resultFuture.completed(managedConn)) {
                             pool.release(entry, true);
                         }
@@ -365,6 +395,9 @@ public class PoolingNHttpClientConnectionManager
             final TimeUnit timeUnit) {
         Args.notNull(managedConn, "Managed connection");
         synchronized (managedConn) {
+            // 先切断租赁代理与池项的关联。此后从这个旧代理读取地址、context 等会抛
+            // ConnectionShutdownException，即使其真实连接随后被池复用，也不能继续借旧代理访问。
+            // 同一代理上的锁与 startRoute/upgrade/routeComplete 协调；重复归还在此直接返回。
             final CPoolEntry entry = CPoolProxy.detach(managedConn);
             if (entry == null) {
                 return;
@@ -375,7 +408,10 @@ public class PoolingNHttpClientConnectionManager
             final NHttpClientConnection conn = entry.getConnection();
             try {
                 if (conn.isOpen()) {
+                    // state 保存到连接而非请求上，后续租赁据此匹配；默认调用方传入 user token。
                     entry.setState(state);
+                    // PoolEntry 的有效期限取“本次归还时间 + keepalive”和创建时 TTL 上限的较小值。
+                    // keepalive <= 0 只是本次不增加闲置期限限制，仍不能越过创建时设定的 TTL。
                     entry.updateExpiry(keepalive, timeUnit != null ? timeUnit : TimeUnit.MILLISECONDS);
                     if (this.log.isDebugEnabled()) {
                         final String s;
@@ -388,6 +424,8 @@ public class PoolingNHttpClientConnectionManager
                     }
                 }
             } finally {
+                // TCP 尚开着仍不充分：未完成 CONNECT/协议分层等路由步骤的连接不能作为成品复用。
+                // pool.release 可能立即满足另一个等待者并触发其回调，不只是把 entry 放回队列。
                 this.pool.release(entry, conn.isOpen() && entry.isRouteComplete());
                 if (this.log.isDebugEnabled()) {
                     this.log.debug("Connection released: " + format(entry) + formatStats(entry.getRoute()));
@@ -413,6 +451,8 @@ public class PoolingNHttpClientConnectionManager
             final HttpContext context) throws IOException {
         Args.notNull(managedConn, "Managed connection");
         Args.notNull(route, "HTTP route");
+        // lease 已拿到 TCP 连接；此处为第一跳应用协议层。有代理时是代理这一跳，
+        // 没有代理时是目标这一跳。默认 HTTP 策略不分层，HTTPS 策略包装现有 IOSession。
         final HttpHost host;
         if (route.getProxyHost() != null) {
             host = route.getProxyHost();
@@ -443,6 +483,8 @@ public class PoolingNHttpClientConnectionManager
             final HttpContext context) throws IOException {
         Args.notNull(managedConn, "Managed connection");
         Args.notNull(route, "HTTP route");
+        // 与 startRoute 的第一跳选择不同，协议升级按最终 target 执行。HTTPS 经 HTTP 代理时，
+        // MainClientExec 在 CONNECT 成功后走到这里；TLS 面向 target，底层 TCP peer 仍是代理。
         final HttpHost host  = route.getTargetHost();
         final Lookup<SchemeIOSessionStrategy> reg = getIOSessionFactoryRegistry(context);
         final SchemeIOSessionStrategy sf = reg.lookup(host.getSchemeName());
@@ -471,6 +513,8 @@ public class PoolingNHttpClientConnectionManager
         Args.notNull(route, "HTTP route");
         synchronized (managedConn) {
             final CPoolEntry entry = CPoolProxy.getPoolEntry(managedConn);
+            // 记录路由步骤已建立，供释放/再次租赁判断。它不表示当前 HTTP 响应已经完成，
+            // 也不等价于 TLS 握手已全部结束：非阻塞 TLS 握手由后续 reactor 事件继续推进。
             entry.markRouteComplete();
         }
     }
@@ -612,6 +656,8 @@ public class PoolingNHttpClientConnectionManager
         @Override
         public ManagedNHttpClientConnection create(
                 final HttpRoute route, final IOSession ioSession) throws IOException {
+            // 新 TCP session 已建立后才进入工厂；连接配置优先取代理，其次 target，再到默认值。
+            // 这里选的是编解码/缓冲区等 ConnectionConfig，不会重新决定网络目的地址。
             ConnectionConfig config = null;
             if (route.getProxyHost() != null) {
                 config = this.configData.getConnectionConfig(route.getProxyHost());
@@ -626,6 +672,8 @@ public class PoolingNHttpClientConnectionManager
                 config = ConnectionConfig.DEFAULT;
             }
             final ManagedNHttpClientConnection conn = this.connFactory.create(ioSession, config);
+            // reactor 的事件分发通过此键取回真实连接，HttpAsyncRequestExecutor 的连接参数
+            // 沿该路径来自此对象；池向 exchange 租出的 CPoolProxy 则委托到同一个对象。
             ioSession.setAttribute(IOEventDispatch.CONNECTION_KEY, conn);
             return conn;
         }
@@ -649,18 +697,24 @@ public class PoolingNHttpClientConnectionManager
 
         @Override
         public SocketAddress resolveLocalAddress(final HttpRoute route) throws IOException {
+            // 指定本地网卡地址时由系统选择临时源端口；null 表示不显式绑定本地地址。
             return route.getLocalAddress() != null ? new InetSocketAddress(route.getLocalAddress(), 0) : null;
         }
 
         @Override
         public SocketAddress resolveRemoteAddress(final HttpRoute route) throws IOException {
+            // 这是 TCP 第一跳：直连才使用 target，有代理时连 proxy，CONNECT 不会在客户端
+            // 再创建一条直达 target 的 socket。这里只生成连接候选地址，成功后的 peer 要从连接读取。
             final HttpHost host;
             if (route.getProxyHost() != null) {
                 host = route.getProxyHost();
             } else {
                 host = route.getTargetHost();
             }
+            // 默认 SchemePortResolver 保留显式正端口，否则按 http/https 补 80/443；可注入替换。
             final int port = this.schemePortResolver.resolve(host);
+            // 当前实现按 hostName 调用 DnsResolver（默认系统 DNS），没有读取 HttpHost.getAddress()。
+            // 数组只取首项，本方法没有依次尝试所有解析地址的回退循环；不能把 DNS 列表视为已连接 peer。
             final InetAddress[] addresses = this.dnsResolver.resolve(host.getHostName());
             return new InetSocketAddress(addresses[0], port);
         }

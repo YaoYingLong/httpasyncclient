@@ -59,6 +59,11 @@ import org.apache.http.util.Asserts;
  * Instances of this class are expected to be accessed by one thread at a time only.
  * The {@link #cancel()} method can be called concurrently by multiple threads.
  */
+// 一个 exchange 的连接所有权与终止控制。普通、minimal、pipeline handler 共享此实现。
+// routeRef 是计划走的路由；routeTrackerRef 是当前已完成的直连/代理/隧道/TLS 步骤；
+// managedConnRef 是本次租赁的连接代理，三者不能互相替代，更不能由 route 推导真实 peer。
+// 原子引用保护跨线程发布和取消竞争；它们不使任意两个协议回调都可以并发调用。
+// 尤其不要并发复用同一个用户 HttpContext：它还保存了可变的 request/response/connection。
 abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeHandler {
 
     private static final AtomicLong COUNTER = new AtomicLong(1);
@@ -70,14 +75,20 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     private final NHttpClientConnectionManager connmgr;
     private final ConnectionReuseStrategy connReuseStrategy;
     private final ConnectionKeepAliveStrategy keepaliveStrategy;
+    // 租连接的 Future 与应用拿到的结果 Future 是两个对象：前者用于取消排队/建连，
+    // 后者由子类在响应消费结束后完成。
     private final AtomicReference<Future<NHttpClientConnection>> connectionFutureRef;
     private final AtomicReference<NHttpClientConnection> managedConnRef;
     private final AtomicReference<HttpRoute> routeRef;
     private final AtomicReference<RouteTracker> routeTrackerRef;
     private final AtomicBoolean routeEstablished;
+    // null 表示不可复用；非 null 才能归还为可复用连接。
+    // 数值 <= 0 表示 keep-alive 未指定有限时长，并不等于“不可复用”，池 TTL 仍可限制寿命。
     private final AtomicReference<Long> validDurationRef;
     private final AtomicReference<HttpRequestWrapper> requestRef;
     private final AtomicReference<HttpResponse> responseRef;
+    // completed 是协议层 isDone 所见的完成标记；closed 是终止/清理的一次性闸门。
+    // failed/cancel 走 closed，但并不设置 completed，不能将二者当作同一状态。
     private final AtomicBoolean completed;
     private final AtomicBoolean closed;
 
@@ -156,6 +167,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final void verifytRoute() {
+        // 从池中取出的连接可能已经完成 CONNECT/TLS；复用时无需再次执行路由建立。
+        // 新连接则建立 tracker，交给 MainClientExec 的 BasicRouteDirector 逐步推进。
         if (!this.routeEstablished.get() && this.routeTrackerRef.get() == null) {
             final NHttpClientConnection managedConn = this.managedConnRef.get();
             Asserts.check(managedConn != null, "Inconsistent state: managed connection is null");
@@ -176,6 +189,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final void onRouteToTarget() throws IOException {
+        // TCP 连接已在租赁阶段建立。startRoute 在已有 IOSession 上启动所需协议层，
+        // 这里的 CONNECT_TARGET 是路由状态机步骤，不是再创建一个 TCP socket。
         final NHttpClientConnection managedConn = this.managedConnRef.get();
         Asserts.check(managedConn != null, "Inconsistent state: managed connection is null");
         final HttpRoute route = this.routeRef.get();
@@ -199,6 +214,7 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final void onRouteUpgrade() throws IOException {
+        // 典型路径是代理 CONNECT 成功后在现有会话上叠加 TLS；TCP 对端仍然是代理。
         final NHttpClientConnection managedConn = this.managedConnRef.get();
         Asserts.check(managedConn != null, "Inconsistent state: managed connection is null");
         final HttpRoute route = this.routeRef.get();
@@ -233,11 +249,14 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final void releaseConnection() {
+        // 先解除本 handler 的所有权，避免取消和完成两条路径重复归还同一次租赁。
         final NHttpClientConnection localConn = this.managedConnRef.getAndSet(null);
         if (localConn != null) {
             if (this.log.isDebugEnabled()) {
                 this.log.debug("[exchange: " + this.id + "] releasing connection");
             }
+            // 这是连接自身的 context，不是应用传入的 localContext。
+            // HTTP_HANDLER 将协议事件路由到当前 exchange；归还之前必须解除此关联。
             localConn.getContext().removeAttribute(HttpAsyncRequestExecutor.HTTP_HANDLER);
             final Long validDuration = this.validDurationRef.get();
             if (validDuration != null) {
@@ -261,6 +280,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final void discardConnection() {
+        // 异常/取消的强制终止路径：shutdown 后归还池槽位，不能复用未完成的协议流。
+        // 连接管理器会 detach 代理；保存过该代理的应用 context 不因此变成稳定快照。
         final NHttpClientConnection localConn = this.managedConnRef.getAndSet(null);
         if (localConn != null) {
             try {
@@ -279,6 +300,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final boolean manageConnectionPersistence() {
+        // 响应结束后的两个独立问题：协议是否允许 keep-alive，以及允许空闲保留多久。
+        // 开着的 socket 不一定可复用（例如响应要求 Connection: close）。
         final HttpResponse response = this.responseRef.get();
         Asserts.check(response != null, "Inconsistent state: HTTP response");
         final NHttpClientConnection managedConn = this.managedConnRef.get();
@@ -308,6 +331,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     private void connectionAllocated(final NHttpClientConnection managedConn) {
+        // manager 的 FutureCallback 将租赁结果交到这里。复用连接可能同步回调，
+        // 新建连接则经 reactor 完成；不能仅凭“异步 API”认定这里总是另一个线程。
         try {
             if (this.log.isDebugEnabled()) {
                 this.log.debug("[exchange: " + this.id + "] Connection allocated: " + managedConn);
@@ -316,6 +341,7 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
             this.managedConnRef.set(managedConn);
 
             if (this.closed.get()) {
+                // 申请连接期间用户可能已取消；刚到达的连接也必须被回收，不能再激活发送。
                 discardConnection();
                 return;
             }
@@ -327,6 +353,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
 
             final HttpContext context = managedConn.getContext();
             synchronized (context) {
+                // 与 HttpCore requestReady 在同一连接 context 上的同步相配合：先发布
+                // handler，再请求 OP_WRITE。requestOutput 只通知 reactor，不直接发送字节。
                 context.setAttribute(HttpAsyncRequestExecutor.HTTP_HANDLER, this);
                 if (managedConn.isStale()) {
                     failed(new ConnectionClosedException("Connection closed"));
@@ -366,6 +394,9 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
             this.log.debug("[exchange: " + this.id + "] Request connection for " + route);
         }
 
+        // 开始新一次租赁时先丢弃旧连接并重置“路由已建立/可复用”状态。
+        // 若新目的地建连失败，后续不会进入 generateRequest；发送点观察者也不会得到
+        // 新 peer。是否清除上次记录属于观察者自己的语义，不能从此路径自动推得。
         discardConnection();
 
         this.validDurationRef.set(null);
@@ -374,6 +405,9 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
 
         final Object userToken = this.localContext.getUserToken();
         final RequestConfig config = this.localContext.getRequestConfig();
+        // userToken 是连接池状态匹配键（例如绑定认证身份），不是 tracing context。
+        // connectTimeout 限制建连，connectionRequestTimeout 限制池租赁等待；
+        // socketTimeout 在发送前另行设置。三者对应不同阶段。
         this.connectionFutureRef.set(this.connmgr.requestConnection(
                 route,
                 userToken,
@@ -408,6 +442,7 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
 
     @Override
     public final void close() {
+        // close 本身只清理，不负责替子类完成结果 Future；调用方必须先决定结果终态。
         if (this.closed.compareAndSet(false, true)) {
             discardConnection();
             releaseResources();
@@ -421,6 +456,7 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
 
     @Override
     public final void failed(final Exception ex) {
+        // 先占有终止权，再通知子类/Future；即使通知抛异常，finally 仍归还连接并关流。
         if (this.closed.compareAndSet(false, true)) {
             try {
                 executionFailed(ex);
@@ -438,6 +474,8 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
         }
         if (this.closed.compareAndSet(false, true)) {
             try {
+                // 用户取消可能与租赁完成、读取响应竞争。取消租赁 Future 只是其中一步，
+                // executionCancelled 决定结果，finally 负责已经分配到的连接和 producer/consumer。
                 final Future<NHttpClientConnection> connectionFuture = this.connectionFutureRef.getAndSet(null);
                 if (connectionFuture != null) {
                     connectionFuture.cancel(true);

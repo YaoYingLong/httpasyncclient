@@ -636,6 +636,9 @@ public class HttpAsyncClientBuilder {
 
     public CloseableHttpAsyncClient build() {
 
+        // build 负责组装可共享的配置、连接池和执行器，不启动网络事件循环。
+        // 每次 execute 的请求状态随后放入独立的 exchange handler / InternalState。
+
         PublicSuffixMatcher publicSuffixMatcher = this.publicSuffixMatcher;
         if (publicSuffixMatcher == null) {
             publicSuffixMatcher = PublicSuffixMatcherLoader.getDefault();
@@ -643,6 +646,8 @@ public class HttpAsyncClientBuilder {
 
         NHttpClientConnectionManager connManager = this.connManager;
         if (connManager == null) {
+            // 只有未提供管理器时，以下 TLS、reactor、连接池容量等配置才由本 builder 创建。
+            // 自定义管理器负责自身连接与底层会话；不能仅凭客户端 builder 推断实际 socket。
             SchemeIOSessionStrategy sslStrategy = this.sslStrategy;
             if (sslStrategy == null) {
                 SSLContext sslcontext = this.sslcontext;
@@ -787,6 +792,8 @@ public class HttpAsyncClientBuilder {
         }
         // Add redirect executor, if not disabled
         HttpRoutePlanner routePlanner = this.routePlanner;
+        // route planner 根据逻辑 target、代理和上下文选择路由。target 与路由都不是
+        // 已建立连接的远端地址，尤其代理连接的 TCP 对端可以与请求 URI 中的主机不同。
         if (routePlanner == null) {
             if (proxy != null) {
                 routePlanner = new DefaultProxyRoutePlanner(proxy, schemePortResolver);
@@ -856,9 +863,16 @@ public class HttpAsyncClientBuilder {
             proxyAuthStrategy,
             userTokenHandler);
 
+        // MainClientExec 管理一次逻辑调用内的路由、认证和重定向状态；下面的
+        // HttpAsyncRequestExecutor 属于 HttpCore，负责连接上的 HTTP 收发事件状态机。
+        // 两个 executor 的生命周期和职责不同，后者的 requestReady(conn) 才直接接收
+        // 当前可发送连接，再经连接上下文查找 handler 并调用其 generateRequest()。
+
         ThreadFactory threadFactory = null;
         NHttpClientEventHandler eventHandler = null;
         if (!this.connManagerShared) {
+            // 非共享模式把线程工厂和事件处理器传给基类，由客户端 start/close 管理 reactor。
+            // 允许注入自定义事件处理器，扩展点覆盖面需要同时考虑它是否委托给默认 executor。
             threadFactory = this.threadFactory;
             if (threadFactory == null) {
                 threadFactory = Executors.defaultThreadFactory();
@@ -868,6 +882,8 @@ public class HttpAsyncClientBuilder {
                 eventHandler = new HttpAsyncRequestExecutor();
             }
         }
+        // 共享模式保持两个局部变量为 null，基类不会创建 reactorThread；调用者必须在
+        // 外部执行管理器的事件循环并负责关闭。客户端 start() 只改变自身接收请求的状态。
         return new InternalHttpAsyncClient(
             connManager,
             reuseStrategy,

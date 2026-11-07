@@ -40,6 +40,11 @@ import org.apache.http.pool.PoolEntry;
 @Contract(threading = ThreadingBehavior.SAFE)
 class CPoolEntry extends PoolEntry<HttpRoute, ManagedNHttpClientConnection> {
 
+    /*
+     * 父类固定保存 route、真实连接、创建时间和 TTL 上限，并保存可变 state/expiry。
+     * 此处 routeComplete 随物理连接保留：TCP 建立只完成第一跳，CONNECT 与 TLS 分层等
+     * 路由步骤由 exchange 驱动；只有已完成路由的连接才能作为可复用连接归还。
+     */
     private final Log log;
     private volatile int socketTimeout;
     private volatile boolean routeComplete;
@@ -59,6 +64,7 @@ class CPoolEntry extends PoolEntry<HttpRoute, ManagedNHttpClientConnection> {
     }
 
     public void markRouteComplete() {
+        // 这是路由建立标志，不是单次 HTTP exchange 的完成标志，也不在每次租赁时清零。
         this.routeComplete = true;
     }
 
@@ -82,6 +88,8 @@ class CPoolEntry extends PoolEntry<HttpRoute, ManagedNHttpClientConnection> {
 
     @Override
     public boolean isExpired(final long now) {
+        // 父类比较 now >= expiry；updateExpiry 会同时受创建时 TTL 限制。
+        // 这里只做判定/日志，实际关闭由池的复用检查或 closeExpired 等清理路径执行。
         final boolean expired = super.isExpired(now);
         if (expired && this.log.isDebugEnabled()) {
             this.log.debug("Connection " + this + " expired @ " + new Date(getExpiry()));

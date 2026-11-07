@@ -39,6 +39,13 @@ import org.apache.http.util.Asserts;
 
 abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClient {
 
+    /*
+     * 客户端生命周期与每次请求的 handler 生命周期分离。非共享管理器模式拥有一个
+     * reactor 驱动线程；默认的多 worker reactor 还会建立自己的 I/O 工作线程。
+     * 不能把 reactorThread 当作所有请求回调唯一所在的线程，调用线程的同步准备失败、
+     * 取消线程以及 I/O 事件线程都可能触发终态通知。
+     */
+
     private final Log log = LogFactory.getLog(getClass());
 
     static enum Status {INACTIVE, ACTIVE, STOPPED}
@@ -61,6 +68,9 @@ abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClien
                 public void run() {
                     try {
                         final IOEventDispatch ioEventDispatch = new InternalIODispatch(handler);
+                        // 阻塞运行管理器的事件循环：InternalIODispatch 把可读/可写事件交给
+                        // 连接的 consumeInput/produceOutput，再进入 HttpCore 的事件处理器。
+                        // 默认处理器为 HttpAsyncRequestExecutor，按连接上的 handler 驱动请求。
                         connmgr.execute(ioEventDispatch);
                     } catch (final Exception ex) {
                         log.error("I/O reactor terminated abnormally", ex);
@@ -71,6 +81,7 @@ abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClien
 
             });
         } else {
+            // 共享管理器模式由 builder 传入 null；客户端不接管外部 reactor 的启动与关闭。
             this.reactorThread = null;
         }
         this.status = new AtomicReference<Status>(Status.INACTIVE);
@@ -78,6 +89,8 @@ abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClien
 
     @Override
     public void start() {
+        // CAS 使启动只生效一次；STOPPED 不会重新变为 ACTIVE。
+        // 共享模式仍需调用 start，但 ACTIVE 本身不能证明外部 reactor 已在运行。
         if (this.status.compareAndSet(Status.INACTIVE, Status.ACTIVE)) {
             if (this.reactorThread != null) {
                 this.reactorThread.start();
@@ -93,6 +106,8 @@ abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClien
 
     @Override
     public void close() {
+        // 只有 ACTIVE -> STOPPED 的调用执行关闭；未 start 的 INACTIVE 实例不会进入此分支。
+        // 拥有 reactorThread 才 shutdown 管理器并等待驱动线程退出；共享模式只停止本客户端。
         if (this.status.compareAndSet(Status.ACTIVE, Status.STOPPED)) {
             if (this.reactorThread != null) {
                 try {

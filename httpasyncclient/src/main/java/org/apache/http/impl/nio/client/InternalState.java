@@ -35,6 +35,9 @@ import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.nio.protocol.HttpAsyncRequestProducer;
 import org.apache.http.nio.protocol.HttpAsyncResponseConsumer;
 
+// 每次普通 execute 独享的协议状态，由 DefaultClientExchangeHandlerImpl 创建。
+// MainClientExec 可被多个请求共享，本对象则随一个逻辑请求跨越多次 CONNECT/认证/重定向。
+// 本类无独立同步机制，依赖 handler 的事件调用约定；不能当作并发共享的请求容器。
 class InternalState {
 
     private final long id;
@@ -42,12 +45,18 @@ class InternalState {
     private final HttpAsyncResponseConsumer<?> responseConsumer;
     private final HttpClientContext localContext;
 
+    // mainRequest 是当前业务请求（重定向后更新）；handler.currentRequest 还可能是 CONNECT。
+    // finalResponse 非 null 才代表交付用户的响应；中间响应存在于 handler.currentResponse。
     private HttpRequestWrapper mainRequest;
     private HttpResponse finalResponse;
     private ByteBuffer tmpbuf;
+    // 一旦进入过 producer.produceContent 即置 true，与 producer.isRepeatable 共同决定能否重发。
+    // 此标记不因 resetRequest 清零；重置读指针不等于实体本身可重复读取。
     private boolean requestContentProduced;
     private int execCount;
 
+    // redirectCount 与 execCount 分开：认证重发会增加发送次数，却不是一次重定向。
+    // redirect 暂存响应头阶段决定的下一跳，等当前响应体消费完后才真正应用并清空。
     private int redirectCount;
     private HttpUriRequest redirect;
 

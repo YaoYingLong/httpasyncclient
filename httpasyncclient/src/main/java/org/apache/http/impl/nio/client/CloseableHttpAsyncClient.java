@@ -56,6 +56,13 @@ import org.apache.http.util.Args;
 @Contract(threading = ThreadingBehavior.SAFE)
 public abstract class CloseableHttpAsyncClient implements HttpAsyncClient, Closeable {
 
+    /*
+     * 这里的 execute 重载负责入口适配，最终汇合到子类的
+     * execute(requestProducer, responseConsumer, context, callback)。producer 提供目标、
+     * 请求头与异步请求体，consumer 接收响应并生成 T，callback 观察最终结果。
+     * 未传 context 的重载为每次调用创建新上下文；显式传入的对象会沿调用链继续使用。
+     */
+
     public abstract boolean isRunning();
 
     public abstract void start();
@@ -72,6 +79,8 @@ public abstract class CloseableHttpAsyncClient implements HttpAsyncClient, Close
     public Future<HttpResponse> execute(
             final HttpHost target, final HttpRequest request, final HttpContext context,
             final FutureCallback<HttpResponse> callback) {
+        // 将普通 HttpRequest 适配为 producer；默认 consumer 缓冲响应体并返回 HttpResponse。
+        // 此时只有逻辑 target，请求还未完成路由选择、租借连接或发送。
         return execute(
                 HttpAsyncMethods.create(target, request),
                 HttpAsyncMethods.createConsumer(),
@@ -101,6 +110,8 @@ public abstract class CloseableHttpAsyncClient implements HttpAsyncClient, Close
         try {
             target = determineTarget(request);
         } catch (final ClientProtocolException ex) {
+            // URI 校验失败直接在当前调用栈完成 Future 并调用 failed 回调；
+            // 并非所有异步 API 的回调都会等到 execute 返回或切换到 I/O 线程。
             final BasicFuture<HttpResponse> future = new BasicFuture<HttpResponse>(callback);
             future.failed(ex);
             return future;
@@ -115,6 +126,8 @@ public abstract class CloseableHttpAsyncClient implements HttpAsyncClient, Close
         HttpHost target = null;
 
         final URI requestURI = request.getURI();
+        // 绝对 URI 的 authority 提供逻辑主机；相对 URI 留下 null 交给后续默认目标处理。
+        // 这里不做 DNS 解析，也不观察代理或连接远端，因此不能作为实际 peer 的来源。
         if (requestURI.isAbsolute()) {
             target = URIUtils.extractHost(requestURI);
             if (target == null) {

@@ -40,6 +40,14 @@ import org.apache.http.util.Args;
  */
 public class HttpAsyncClients {
 
+    /*
+     * 工厂只组装客户端，返回值还需要 start() 才能接受请求。完整客户端由
+     * HttpAsyncClientBuilder 创建，使用 DefaultClientExchangeHandlerImpl / MainClientExec
+     * 处理认证、路由和重定向；minimal 与 pipelining 都由 MinimalHttpAsyncClientBuilder
+     * 创建，最终是同一个 MinimalHttpAsyncClient，但普通请求与批量请求使用不同的 handler。
+     * 因此，检查某个发送阶段扩展点是否覆盖所有入口时，需要分别追踪这三种 handler。
+     */
+
     private HttpAsyncClients() {
         super();
     }
@@ -114,6 +122,8 @@ public class HttpAsyncClients {
      */
     public static CloseableHttpAsyncClient createMinimal(
             final NHttpClientConnectionManager connManager, final boolean shared) {
+        // shared 表示管理器的生命周期由调用者负责，并不是是否启用连接池复用。
+        // 不带 shared 的重载传 false，即使管理器来自外部，客户端仍负责驱动和关闭它。
         Args.notNull(connManager, "Connection manager");
         return MinimalHttpAsyncClientBuilder.create()
                 .setConnectionManager(connManager)
@@ -129,6 +139,7 @@ public class HttpAsyncClients {
      * @since 4.1
      */
     public static CloseableHttpPipeliningClient createPipelining() {
+        // pipeline 的批次顺序由专用 handler 维护；完整客户端的批量 execute 会直接拒绝。
         return MinimalHttpAsyncClientBuilder.create().build();
     }
 

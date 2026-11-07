@@ -161,6 +161,15 @@ public class SSLIOSessionStrategy implements SchemeIOSessionStrategy {
 
     @Override
     public SSLIOSession upgrade(final HttpHost host, final IOSession ioSession) throws IOException {
+        /*
+         * host 是当前要验证的 TLS 对端身份，ioSession 是已经连好的传输。直连 HTTPS 时
+         * host 是 target；HTTPS 经 HTTP 代理时，CONNECT 成功后仍在连向 proxy 的同一个
+         * session 上为 target 建立 TLS。这里没有 DNS 解析或新建 TCP socket。
+         *
+         * HttpCore SSLIOSession 用 host 为 SSLEngine 提供 peer host/port，证书主机名校验
+         * 则走下面的 verifySession；它的 getRemoteAddress 仍委托底层 IOSession。
+         * TLS 身份与 TCP peer 是两个层次，不能把 SSL host 直接当作 socket 地址。
+         */
         Asserts.check(!(ioSession instanceof SSLIOSession), "I/O session is already upgraded to TLS/SSL");
         final SSLIOSession sslioSession = new SSLIOSession(
             ioSession,
@@ -189,7 +198,9 @@ public class SSLIOSessionStrategy implements SchemeIOSessionStrategy {
                 }
 
         });
+        // 原 session 上登记 TLS 包装，供事件分发识别并推进握手/加解密；属性访问也向原 session 委托。
         ioSession.setAttribute(SSLIOSession.SESSION_KEY, sslioSession);
+        // initialize 启动非阻塞握手，返回包装不等于握手或证书校验已经完成；后续 I/O 事件继续推进。
         sslioSession.initialize();
         return sslioSession;
     }

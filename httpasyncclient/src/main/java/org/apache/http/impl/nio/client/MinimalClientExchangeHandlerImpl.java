@@ -60,6 +60,9 @@ import org.apache.http.protocol.HttpProcessor;
  */
 class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler {
 
+    // 一次普通请求持有固定的 producer/consumer；与 pipeline 的整批队列不同，
+    // 原始请求在 start 中生成，发送阶段 generateRequest 只返回准备好的请求包装器。
+
     private final HttpAsyncRequestProducer requestProducer;
     private final HttpAsyncResponseConsumer<T> responseConsumer;
     private final HttpClientContext localContext;
@@ -100,12 +103,16 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
 
     @Override
     void executionFailed(final Exception ex) {
+        // 此实现只通知 producer/consumer；与 Default handler 不同，这个方法没有
+        // resultFuture.failed(ex)。阅读失败完成路径时需以该实现为准，不能套用 Default 的逻辑。
         this.requestProducer.failed(ex);
         this.responseConsumer.failed(ex);
     }
 
     @Override
     boolean executionCancelled() {
+        // consumer.cancel 的布尔值与结果 Future 的最终状态不是同一件事：
+        // consumer 已有异常则发布失败，已有结果则发布成功，否则才发布取消。
         final boolean cancelled = this.responseConsumer.cancel();
 
         final T result = this.responseConsumer.getResult();
@@ -121,10 +128,14 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
     }
 
     public void start() throws HttpException, IOException {
+        // 由 MinimalHttpAsyncClient.execute 同步调用。target 来自 producer，原始 request
+        // 也在租借连接之前产生；这里拿不到本次发送实际使用的连接远端。
         final HttpHost target = this.requestProducer.getTarget();
         final HttpRequest original = this.requestProducer.generateRequest();
 
         if (original instanceof HttpExecutionAware) {
+            // 将 HttpUriRequest.abort 等请求级取消连接到同一个 handler，和 Future.cancel
+            // 共用后续取消/资源清理路径；不是另建一个只取消 Future 的标记。
             ((HttpExecutionAware) original).setCancellable(this);
         }
         if (this.log.isDebugEnabled()) {
@@ -139,6 +150,8 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
         }
 
         final HttpRequestWrapper request = HttpRequestWrapper.wrap(original);
+        // minimal 直接以 target 创建路由，不调用完整客户端的 HttpRoutePlanner。
+        // 请求配置、上下文和协议拦截器在 start 中准备完成后才开始申请连接。
         final HttpRoute route = new HttpRoute(target);
         setCurrentRequest(request);
         setRoute(route);
@@ -154,6 +167,8 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
 
     @Override
     public HttpRequest generateRequest() throws IOException, HttpException {
+        // 这是 HttpCore 发送阶段的 handler 入口，连接此时已分配给该 exchange。
+        // 如果只在 DefaultClientExchangeHandlerImpl 上扩展，此普通 minimal 路径不会被覆盖。
         verifytRoute();
         if (!isRouteEstablished()) {
             onRouteToTarget();
@@ -183,6 +198,7 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
 
     @Override
     public void requestCompleted() {
+        // 输出完成通知直接调用 producer，尚未等待响应；context 仍是本次执行的可变上下文。
         if (this.log.isDebugEnabled()) {
             this.log.debug("[exchange: " + getId() + "] Request completed");
         }
@@ -211,6 +227,8 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
         }
         this.responseConsumer.consumeContent(decoder, ioControl);
         if (!decoder.isCompleted() && this.responseConsumer.isDone()) {
+            // consumer 提前结束而响应体未读完，连接不能回池复用，否则残留字节会污染下次响应。
+            // 此分支取消结果并走统一 close，而不是把“consumer 已完成”直接当成请求成功。
             markConnectionNonReusable();
             try {
                 markCompleted();
@@ -231,6 +249,9 @@ class MinimalClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
         }
         try {
             markCompleted();
+            // 先归还/关闭连接，再读取 consumer 结果并完成 BasicFuture；用户 callback 执行时
+            // handler 的连接引用已被清空，context 中残留的连接也可能已脱离本次租约。
+            // 因此在终态回调时读取 context.getConnection() 不能可靠还原本次实际 peer。
             releaseConnection();
             final T result = this.responseConsumer.getResult();
             final Exception ex = this.responseConsumer.getException();

@@ -52,6 +52,13 @@ import org.apache.http.protocol.HttpProcessor;
 
 class MinimalHttpAsyncClient extends CloseableHttpAsyncClientBase {
 
+    /*
+     * 只执行必要的 HTTP 协议处理，不经过 MainClientExec 的认证和自动重定向状态机。
+     * 普通 execute 为一组 producer/consumer 创建 MinimalClientExchangeHandlerImpl；
+     * 批量 execute 则为同一 target 的整组请求创建 PipeliningClientExchangeHandlerImpl。
+     * 两条路径共享管理器与 reactor，但请求生成的时间、结果类型和完成条件不同。
+     */
+
     private final Log log = LogFactory.getLog(getClass());
 
     private final NHttpClientConnectionManager connmgr;
@@ -95,6 +102,9 @@ class MinimalHttpAsyncClient extends CloseableHttpAsyncClientBase {
         final HttpClientContext localcontext = HttpClientContext.adapt(
             context != null ? context : new BasicHttpContext());
 
+        // start 同步生成普通请求并申请连接；异常可能在 execute 返回前触发失败处理。
+        // 请求后续由 I/O 事件推进，取消则可由任意调用 Future.cancel 的线程发起。
+
         final MinimalClientExchangeHandlerImpl<T> handler = new MinimalClientExchangeHandlerImpl<T>(
             this.log,
             requestProducer,
@@ -122,6 +132,9 @@ class MinimalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             final FutureCallback<List<T>> callback) {
         ensureRunning();
         final BasicFuture<List<T>> future = new BasicFuture<List<T>>(callback);
+        // target 显式来自批量 execute 参数；便利重载按 requests 的顺序生成等长的
+        // producer/consumer 列表。这里只创建一个批次 Future，成功值按原顺序汇总为 List<T>。
+        // handler.start 先申请连接，各 producer.generateRequest 留到实际发送阶段逐个调用。
         final HttpClientContext localcontext = HttpClientContext.adapt(
                 context != null ? context : new BasicHttpContext());
         final PipeliningClientExchangeHandlerImpl<T> handler = new PipeliningClientExchangeHandlerImpl<T>(

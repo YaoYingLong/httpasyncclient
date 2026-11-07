@@ -91,6 +91,8 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
     }
 
     private void setupContext(final HttpClientContext context) {
+        // 仅补齐缺失属性，不覆盖显式上下文的认证状态、注册表和请求配置。
+        // adapt 只是适配调用者的 context，并不复制隔离；复用同一个 context 会共享可变属性。
         if (context.getAttribute(HttpClientContext.TARGET_AUTH_STATE) == null) {
             context.setAttribute(HttpClientContext.TARGET_AUTH_STATE, new AuthState());
         }
@@ -121,6 +123,8 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             final HttpContext context,
             final FutureCallback<T> callback) {
         ensureRunning();
+        // BasicFuture 保存最终结果并直接调用 callback，没有额外的回调线程池。
+        // HttpCore 先设置完成状态并唤醒 get()，再执行 callback；get 返回不代表回调已结束。
         final BasicFuture<T> future = new BasicFuture<T>(callback);
         final HttpClientContext localcontext = HttpClientContext.adapt(
             context != null ? context : new BasicHttpContext());
@@ -137,6 +141,10 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             this.keepaliveStrategy,
             this.exec);
         try {
+            // start 在 execute 的调用线程同步执行：getTarget -> producer.generateRequest
+            // -> MainClientExec.prepare -> requestConnection。原始请求生成时尚未租到本次连接。
+            // 后续 HttpCore requestReady(conn) 调用的是 handler.generateRequest，后者委托
+            // MainClientExec，不能与这里的 producer.generateRequest 混为一个时机。
             handler.start();
         } catch (final Exception ex) {
             handler.failed(ex);
@@ -151,6 +159,7 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             final List<? extends HttpAsyncResponseConsumer<T>> responseConsumers,
             final HttpContext context,
             final FutureCallback<List<T>> callback) {
+        // 完整客户端虽继承批量 API，却不支持 pipeline；该入口需要 createPipelining()。
         throw new UnsupportedOperationException("Pipelining not supported");
     }
 
