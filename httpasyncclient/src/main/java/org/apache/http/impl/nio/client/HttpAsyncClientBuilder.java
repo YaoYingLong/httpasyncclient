@@ -870,6 +870,7 @@ public class HttpAsyncClientBuilder {
 
         ThreadFactory threadFactory = null;
         NHttpClientEventHandler eventHandler = null;
+        // 默认是没有设置connManagerShared所以是能进入if
         if (!this.connManagerShared) {
             // 非共享模式把线程工厂和事件处理器传给基类，由客户端 start/close 管理 reactor。
             // 允许注入自定义事件处理器，扩展点覆盖面需要同时考虑它是否委托给默认 executor。
@@ -889,6 +890,7 @@ public class HttpAsyncClientBuilder {
             reuseStrategy,
             keepAliveStrategy,
             threadFactory,
+            // 一般默认为HttpAsyncRequestExecutor
             eventHandler,
             exec,
             cookieSpecRegistry,

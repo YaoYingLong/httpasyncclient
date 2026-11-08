@@ -310,6 +310,19 @@ public class PoolingNHttpClientConnectionManager
             return resultFuture;
         }
         /*
+         * lease 可以理解为“从池里借一条连接供这次请求使用”。实际选择逻辑在依赖 HttpCore
+         * 的 AbstractNIOConnPool.processPendingRequest 中，CPool 继承了这套逻辑：
+         *
+         * 1. 找到同 route、状态匹配且未关闭/过期的空闲连接：直接借出，不再创建 socket。
+         * 2. 没找到，但连接数限制允许创建：解析地址，调用 ioReactor.connect 提交建连任务。
+         * 3. 暂时无法借出或创建：申请留在等待队列中，等释放连接等事件重新推进，或等待超时。
+         *
+         * 第 2 种情况下，DefaultConnectingIOReactor.connect 先把任务入队、唤醒事件循环。
+         * Reactor 的 processSessionRequests 才执行 SocketChannel.open/connect；若尚未连好，
+         * 再等连接完成事件并执行 finishConnect。连接成功后创建 IOSession，通知池的
+         * requestCompleted；池通过下面的 InternalConnectionFactory 创建 HTTP 连接对象。
+         * 池随后交付 CPoolEntry，执行这里的 completed(entry)，再把连接传给请求的 handler。
+         *
          * HttpCore 4.4.11 的池先找相同 route、匹配 state（或未绑定 state）的空闲 entry，
          * 淘汰关闭/过期项；找不到且容量允许时才解析地址并调用 ioReactor.connect。
          * 复用不重新 DNS 解析，因此即使同一路由的 DNS 已变化，现存连接仍连接原来的 peer。
@@ -330,9 +343,12 @@ public class PoolingNHttpClientConnectionManager
                             log.debug("Connection leased: " + format(entry) + formatStats(entry.getRoute()));
                         }
                         // 即使复用同一个 entry，也为当前租赁创建独立代理；回调拿到的不是池内实体。
+                        // CPoolProxy 是管理借出/归还生命周期的 Java 包装对象，与 HTTP 代理服务器无关。
                         final NHttpClientConnection managedConn = CPoolProxy.newProxy(entry);
                         // BasicFuture 先发布结果/唤醒 get()，随后在当前线程直接调用 callback。
                         // 返回 false 表示外层 Future 已终结（例如取消抢先发生），需要归还 entry。
+                        // 调用本方法接收的 callback.completed(managedConn)，于是进入
+                        // AbstractClientExchangeHandler.connectionAllocated，后续发送便接上了。
                         if (!resultFuture.completed(managedConn)) {
                             pool.release(entry, true);
                         }
@@ -453,6 +469,7 @@ public class PoolingNHttpClientConnectionManager
         Args.notNull(route, "HTTP route");
         // lease 已拿到 TCP 连接；此处为第一跳应用协议层。有代理时是代理这一跳，
         // 没有代理时是目标这一跳。默认 HTTP 策略不分层，HTTPS 策略包装现有 IOSession。
+        // 因而普通 HTTP 走到本方法时，不需要再次 connect；直连 HTTPS 则在已有连接上启动 TLS。
         final HttpHost host;
         if (route.getProxyHost() != null) {
             host = route.getProxyHost();
@@ -706,6 +723,8 @@ public class PoolingNHttpClientConnectionManager
             // 这是 TCP 第一跳：直连才使用 target，有代理时连 proxy，CONNECT 不会在客户端
             // 再创建一条直达 target 的 socket。这里只生成连接候选地址，成功后的 peer 要从连接读取。
             final HttpHost host;
+            // 例：请求 https://example.com/users，代理是 http://proxy.example:8080，
+            // 则此处解析 proxy.example 并连接其 8080 端口。example.com:443 留给 CONNECT 请求。
             if (route.getProxyHost() != null) {
                 host = route.getProxyHost();
             } else {

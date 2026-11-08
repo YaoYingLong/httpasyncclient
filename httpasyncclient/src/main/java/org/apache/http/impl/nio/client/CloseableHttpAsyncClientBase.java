@@ -67,6 +67,7 @@ abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClien
                 @Override
                 public void run() {
                     try {
+                        // handler一般默认为HttpAsyncRequestExecutor
                         final IOEventDispatch ioEventDispatch = new InternalIODispatch(handler);
                         // 阻塞运行管理器的事件循环：InternalIODispatch 把可读/可写事件交给
                         // 连接的 consumeInput/produceOutput，再进入 HttpCore 的事件处理器。
@@ -89,6 +90,9 @@ abstract class CloseableHttpAsyncClientBase extends CloseableHttpPipeliningClien
 
     @Override
     public void start() {
+        // 应在调用 execute 前启动客户端。这里启动的是持续处理网络事件的后台循环，
+        // 后续多次 execute 都由它驱动；每次 execute 不会另外创建一套网络线程。
+        // 事件如何进入发送代码，可接着看 InternalIODispatch.onConnected/onOutputReady。
         // CAS 使启动只生效一次；STOPPED 不会重新变为 ACTIVE。
         // 共享模式仍需调用 start，但 ACTIVE 本身不能证明外部 reactor 已在运行。
         if (this.status.compareAndSet(Status.INACTIVE, Status.ACTIVE)) {

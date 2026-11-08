@@ -331,6 +331,14 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     private void connectionAllocated(final NHttpClientConnection managedConn) {
+        /*
+         * 连接池已经把一条连接交给本次请求了：新建时 TCP 已连好，复用时 TCP 早已存在。
+         * 例如直连 example.com 时，它连向目标；配置 HTTP 代理时，它连向代理。
+         * HTTPS 请求经 HTTP 代理时，CONNECT 和 TLS 仍可能尚未开始，由 MainClientExec 继续处理。
+         *
+         * 下面做两次关联：本 handler 保存连接；连接的 context 保存本 handler。
+         * 这样“本次请求”能找到连接，“收到网络事件的连接”也能找到本次请求。
+         */
         // manager 的 FutureCallback 将租赁结果交到这里。复用连接可能同步回调，
         // 新建连接则经 reactor 完成；不能仅凭“异步 API”认定这里总是另一个线程。
         try {
@@ -338,6 +346,7 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
                 this.log.debug("[exchange: " + this.id + "] Connection allocated: " + managedConn);
             }
             this.connectionFutureRef.set(null);
+            // 从这一行起，handler.getConnection() 就能取得本次分配到的连接。
             this.managedConnRef.set(managedConn);
 
             if (this.closed.get()) {
@@ -355,10 +364,14 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
             synchronized (context) {
                 // 与 HttpCore requestReady 在同一连接 context 上的同步相配合：先发布
                 // handler，再请求 OP_WRITE。requestOutput 只通知 reactor，不直接发送字节。
+                // this 就是 execute() 创建的那个 handler；HttpCore 稍后通过这个键把它取回。
                 context.setAttribute(HttpAsyncRequestExecutor.HTTP_HANDLER, this);
                 if (managedConn.isStale()) {
                     failed(new ConnectionClosedException("Connection closed"));
                 } else {
+                    // 底层只设置 SelectionKey.OP_WRITE，意思是“请继续处理这条连接的输出”。
+                    // 写事件进入 InternalIODispatch.onOutputReady；新连接的 onConnected
+                    // 也会触发首轮 requestReady。真正写字节的代码在 HttpCore 的连接实现中。
                     managedConn.requestOutput();
                 }
             }
@@ -389,6 +402,12 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
     }
 
     final void requestConnection() {
+        /*
+         * 这里的申请方式是“给我连接，准备好后调用 completed(conn)”。
+         * 所以下面的 FutureCallback 要分两步理解：现在创建并传给管理器；连接交付时，
+         * 管理器再调用它的 completed 方法。没有在此通过 Future.get() 阻塞等待连接。
+         * 若池中已有合适的空闲连接，completed 也可能在本次调用尚未返回时立即执行。
+         */
         final HttpRoute route = this.routeRef.get();
         if (this.log.isDebugEnabled()) {
             this.log.debug("[exchange: " + this.id + "] Request connection for " + route);
@@ -418,6 +437,7 @@ abstract class AbstractClientExchangeHandler implements HttpAsyncClientExchangeH
 
                     @Override
                     public void completed(final NHttpClientConnection managedConn) {
+                        // 这是“连接拿到了”的回调；不是用户传入 execute 的“响应处理完成”回调。
                         connectionAllocated(managedConn);
                     }
 

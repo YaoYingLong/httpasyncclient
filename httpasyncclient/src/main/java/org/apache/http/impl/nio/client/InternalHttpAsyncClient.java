@@ -78,6 +78,7 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             final CookieStore cookieStore,
             final CredentialsProvider credentialsProvider,
             final RequestConfig defaultConfig) {
+        // handler一般默认为HttpAsyncRequestExecutor
         super(connmgr, threadFactory, handler);
         this.connmgr = connmgr;
         this.connReuseStrategy = connReuseStrategy;
@@ -122,6 +123,19 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             final HttpAsyncResponseConsumer<T> responseConsumer,
             final HttpContext context,
             final FutureCallback<T> callback) {
+        /*
+         * 阅读例子：发送 GET http://example.com/users。
+         * 可以先把本次执行理解成三件事：准备请求 -> 借到连接 -> 在连接上发送请求。
+         *
+         * 本方法先创建一个 handler，作为这次请求的“负责人”：它保存请求、响应处理器、
+         * 最终结果以及稍后分配的连接。连接管理器 connmgr 则由很多次请求共同使用。
+         * handler.start() 会开始准备请求和申请连接；拿到连接后的工作通过回调继续。
+         * 真正的网络读写由 client.start() 已经启动的 I/O 事件循环驱动。
+         *
+         * 跟读顺序：DefaultClientExchangeHandlerImpl.start()
+         * -> AbstractClientExchangeHandler.requestConnection()
+         * -> connectionAllocated() -> InternalIODispatch -> MainClientExec.generateRequest()。
+         */
         ensureRunning();
         // BasicFuture 保存最终结果并直接调用 callback，没有额外的回调线程池。
         // HttpCore 先设置完成状态并唤醒 get()，再执行 callback；get 返回不代表回调已结束。
@@ -130,6 +144,7 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
             context != null ? context : new BasicHttpContext());
         setupContext(localcontext);
 
+        // 创建“本次请求的负责人”。此处只是创建对象，还没有给它分配连接。
         final DefaultClientExchangeHandlerImpl<T> handler = new DefaultClientExchangeHandlerImpl<T>(
             this.log,
             requestProducer,
@@ -149,6 +164,8 @@ class InternalHttpAsyncClient extends CloseableHttpAsyncClientBase {
         } catch (final Exception ex) {
             handler.failed(ex);
         }
+        // 返回的是将来取得响应结果的凭据；这里没有等待连接成功，也没有等待响应完成。
+        // 若连接池立即复用已有连接，连接成功回调也可能已经在 start() 内执行过。
         return new FutureWrapper<T>(future, handler);
     }
 

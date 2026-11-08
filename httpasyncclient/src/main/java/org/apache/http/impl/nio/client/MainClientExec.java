@@ -145,8 +145,13 @@ class MainClientExec implements InternalClientExec {
         final HttpRequestWrapper request = HttpRequestWrapper.wrap(original);
         final HttpRoute route = this.routePlanner.determineRoute(target, request, localContext);
 
+        // 关键代码，后续的逻辑中才能获取到
+        // route 是“应该怎样到达目标”的计划，包含目标、代理、是否需要隧道/TLS等信息。
+        // 这里只保存计划，没有创建连接；start() 接下来会拿这个 route 去连接池申请连接。
         handler.setRoute(route);
 
+        // 初始时，两处都保存用户原本的 GET。mainRequest 留存业务请求，currentRequest 表示
+        // “本轮要发的请求”；HTTPS 请求走 HTTP 代理时，它会暂时换成内部创建的 CONNECT。
         state.setMainRequest(request);
         handler.setCurrentRequest(request);
 
@@ -159,6 +164,19 @@ class MainClientExec implements InternalClientExec {
     public HttpRequest generateRequest(
             final InternalState state,
             final AbstractClientExchangeHandler handler) throws IOException, HttpException {
+
+        /*
+         * 调用者是 HttpCore 的 HttpAsyncRequestExecutor.requestReady(conn)。它已经拿到连接，
+         * 现在调用本方法询问“本轮发什么”，然后执行 conn.submitRequest(本方法返回的请求)。
+         *
+         * 先看最简单的 GET http://example.com/users：池已建立 TCP -> 下面登记直连路由完成
+         * -> 返回准备好的 GET。这里的 CONNECT_TARGET 只是路由步骤名称，不是 HTTP CONNECT。
+         *
+         * 再看 GET https://example.com/users 经过 HTTP 代理：池已连到代理 -> 第一轮返回
+         * CONNECT example.com:443 -> 等代理响应 200 -> 下一轮启动 TLS，再返回原来的 GET。
+         * 同一个 handler 因此可以多次来到这里；最初 producer.generateRequest() 提供的 GET
+         * 一直保存在 state.mainRequest 中，不必重新创建一个用户 producer。
+         */
 
         final HttpRoute route = handler.getRoute();
 
@@ -188,10 +206,13 @@ class MainClientExec implements InternalClientExec {
                     // 本轮先返回 CONNECT，待其响应成功后下一轮 generateRequest 再继续。
                     final HttpRequest connect = createConnectRequest(route, state);
                     handler.setCurrentRequest(HttpRequestWrapper.wrap(connect));
+                    // 跳出这个路由循环，让方法往下返回 CONNECT。此处不会阻塞等代理响应；
+                    // 代理响应稍后进入 responseReceived，处理结束后再请求下一次输出。
                     break loop;
                 case HttpRouteDirector.TUNNEL_PROXY:
                     throw new HttpException("Proxy chains are not supported");
                 case HttpRouteDirector.LAYER_PROTOCOL:
+                    // CONNECT 成功后才走到这里：给当前连接加上 TLS，不再申请另一条 TCP 连接。
                     handler.onRouteUpgrade();
                     break;
                 case HttpRouteDirector.UNREACHABLE:
@@ -211,6 +232,7 @@ class MainClientExec implements InternalClientExec {
         final HttpClientContext localContext = state.getLocalContext();
         HttpRequestWrapper currentRequest = handler.getCurrentRequest();
         if (currentRequest == null) {
+            // CONNECT 的 200 响应会把 currentRequest 清空；现在恢复用户原本的 GET /users。
             currentRequest = state.getMainRequest();
             handler.setCurrentRequest(currentRequest);
         }
@@ -265,6 +287,7 @@ class MainClientExec implements InternalClientExec {
         if (config.getSocketTimeout() > 0) {
             managedConn.setSocketTimeout(config.getSocketTimeout());
         }
+        // 把本轮请求交还 HttpCore；随后 submitRequest 编码请求行和请求头，可写事件负责写出。
         return currentRequest;
     }
 
@@ -295,7 +318,9 @@ class MainClientExec implements InternalClientExec {
         }
         final HttpClientContext localContext = state.getLocalContext();
         final HttpAsyncRequestProducer requestProducer = state.getRequestProducer();
-        // 只表示当前请求发送完成，不是服务端处理完毕或逻辑 execute 完成。
+        // 这是 HttpCore 对当前请求提交/内容生产完成的通知；输出缓冲区仍可能有未刷出的字节。
+        // 例如无请求体的 GET，submitRequest 后即可通知这里，实际 flush 可以发生在后面。
+        // 因此不能据此认定服务器已收到请求、处理完毕或逻辑 execute 已完成。
         // HttpCore 可在 Expect: 100-continue 阶段收到最终拒绝响应而不调用此方法，
         // 因此它既不是每次响应必经点，也不是可靠的首次连接观测点。
         requestProducer.requestCompleted(localContext);
@@ -326,6 +351,9 @@ class MainClientExec implements InternalClientExec {
             if (status == HttpStatus.SC_OK) {
                 // 仅推进到隧道已建立；TLS/业务请求在下一次发送事件完成，不在此递归发送。
                 handler.onRouteTunnelToTarget();
+                // 隧道已建立，本轮 CONNECT 用完了。下次 generateRequest 先推进 TLS，
+                // 再从 mainRequest 取回原始业务请求。下一轮由 handler.responseCompleted
+                // 中的 requestOutput() 继续触发，而不是在这里直接递归发送。
                 handler.setCurrentRequest(null);
             } else {
                 if (!handleConnectResponse(state, handler)) {

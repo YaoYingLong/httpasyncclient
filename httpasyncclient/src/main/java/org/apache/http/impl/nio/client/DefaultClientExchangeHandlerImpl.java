@@ -135,19 +135,26 @@ class DefaultClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
         // 第一次生成的是用户的逻辑请求，此时本 handler 尚未申请连接。
         // producer.getTarget 提供路由规划输入，generateRequest 提供 method/URI/headers/entity。
         // 即便调用者恰好是另一次请求的 I/O 回调，也不能借用该线程外层请求的连接。
+        // 第 1 步：问 producer“想访问谁”，例如 http://example.com。
         final HttpHost target = this.requestProducer.getTarget();
+        // 第 2 步：得到描述 GET /users 的 Java 对象。这里只准备请求信息，尚未写入网络。
         final HttpRequest original = this.requestProducer.generateRequest();
 
         if (original instanceof HttpExecutionAware) {
             // 将 HttpUriRequest.abort 等入口绑定到本次 exchange 的取消与资源清理。
             ((HttpExecutionAware) original).setCancellable(this);
         }
+        // 第 3 步：决定直连还是走代理，把 route 和请求对象保存起来，供后续回调使用。
         this.exec.prepare(target, original, this.state, this);
+        // 第 4 步：向连接池借连接。下一处要跟的是父类 requestConnection() 中的 completed。
+        // 没有可立即交付的连接时，本方法可以先返回，等连接准备好后再通过回调接着执行。
         requestConnection();
     }
 
     @Override
     public HttpRequest generateRequest() throws IOException, HttpException {
+        // 读到这里时，连接已经交付了。I/O 线程在 HttpAsyncRequestExecutor.requestReady(conn)
+        // 中找到本 handler，并询问“这条连接现在应该发送什么”。返回值随后交给 conn.submitRequest。
         // 与上面 producer.generateRequest 不是同一个阶段：HttpCore 已拿到连接，
         // 从连接 context 取出本 handler 后才调用这里。exec 可返回 CONNECT 或业务请求；
         // 同一 handler 会因认证/重定向多次到达这里，因此这是每次实际发送前的关联点。
@@ -163,12 +170,15 @@ class DefaultClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
 
     @Override
     public void requestCompleted() {
+        // 在HttpAsyncRequestExecutor中的requestReady方法执行完成请求内容发送到服务端后会被执行该方法
+        // 这里其实调用super.getConnection()是能获取到连接的
         this.exec.requestCompleted(this.state, this);
     }
 
     @Override
     public void responseReceived(
             final HttpResponse response) throws IOException, HttpException {
+        // 接收到response后被调用
         this.exec.responseReceived(response, this.state, this);
     }
 
@@ -223,6 +233,8 @@ class DefaultClientExchangeHandlerImpl<T> extends AbstractClientExchangeHandler 
                 localConn = null;
             }
             if (localConn != null) {
+                // 例如刚处理完代理的 CONNECT 成功响应：还要继续发送用户原本的 GET。
+                // 重新关注写事件，之后 I/O 线程再次调用本 handler.generateRequest()。
                 localConn.requestOutput();
             } else {
                 requestConnection();

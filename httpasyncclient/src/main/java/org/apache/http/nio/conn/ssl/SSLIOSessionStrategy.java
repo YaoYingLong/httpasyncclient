@@ -162,6 +162,11 @@ public class SSLIOSessionStrategy implements SchemeIOSessionStrategy {
     @Override
     public SSLIOSession upgrade(final HttpHost host, final IOSession ioSession) throws IOException {
         /*
+         * 以 HTTPS 经过普通 HTTP 代理为例：进入这里前，客户端已经连到代理，并收到
+         * CONNECT example.com:443 的 200 响应。代理此时提供的是通向目标的字节通道。
+         * 下面让这条通道使用 TLS：ioSession 仍对应连向代理的 TCP 连接，host 则是 example.com，
+         * 用于 TLS 目标身份和证书校验。后续 GET /users 通过这条通道加密传输。
+         *
          * host 是当前要验证的 TLS 对端身份，ioSession 是已经连好的传输。直连 HTTPS 时
          * host 是 target；HTTPS 经 HTTP 代理时，CONNECT 成功后仍在连向 proxy 的同一个
          * session 上为 target 建立 TLS。这里没有 DNS 解析或新建 TCP socket。
